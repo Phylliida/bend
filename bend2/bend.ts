@@ -1235,6 +1235,43 @@ export function lit_step(t: Extract<LTerm, { $: "Lit" }>): LTerm {
 }
 
 // the whole chain: a pattern's view
+// nat_prim: the Nat operations whose own definitions run the stack out on
+// literal operands. add and mul are not tail-recursive, div and mod run divmod's
+// loop; sub and cmp are tail-recursive and need none of this.
+const NAT_OP = new Map<string, (a: number, b: number) => number>([
+  ["Nat.add", (a, b) => a + b], ["Nat.mul", (a, b) => a * b],
+  ["Nat.div", (a, b) => b === 0 ? 0 : Math.floor(a / b)], ["Nat.mod", (a, b) => b === 0 ? a : a % b],
+]);
+
+// past NAT_LITERAL_MAX the parser stops writing succ towers and spells
+// Nat.add(n, T) instead, so that is also where unfolding one stops being cheap
+function nat_big(t: HTerm): boolean {
+  return t.$ === "Lit" && typeof t.v === "number" && t.v > NAT_LITERAL_MAX;
+}
+
+// an operand counts only where it is already a literal, or one of these over two
+function nat_num(t: HTerm): number | null {
+  const f = term_force(t);
+  if (f.$ === "Lit") return typeof f.v === "number" ? f.v : null;
+  if (f.$ !== "App" || f.f.$ !== "App" || f.f.f.$ !== "Ref") return null;
+  const op = NAT_OP.get(f.f.f.k);
+  if (op === undefined) return null;
+  const x = f.f.x, y = f.x;
+  if ((x.$ !== "Lit" && x.$ !== "App") || (y.$ !== "Lit" && y.$ !== "App")) return null;
+  const a = nat_num(x), b = nat_num(y);
+  if (a === null || b === null) return null;
+  const v = op(a, b);
+  return v > 0xffffffff ? null : v;
+}
+
+function nat_prim(tm: HTerm): HTerm | null {
+  if (tm.$ !== "App") return null;
+  const h = tm.f;
+  if (!nat_big(tm.x) && !(h.$ === "App" && nat_big(h.x))) return null;
+  const v = nat_num(tm);
+  return v === null ? null : Lit(v);
+}
+
 export function lit_full(t: Extract<LTerm, { $: "Lit" }>): LTerm {
   if (typeof t.v === "string") {
     return lit_chain([...t.v].map((c) => c.codePointAt(0) as U32), t.s);
@@ -2934,7 +2971,14 @@ export function body_flatten(b: Body, vars: PVar[], fr: () => number): LTerm {
 // a rewrite demands its evidence and steps to its body on {==}, else
 // sticks as a value.
 
+// the fast path sits at the entry, not in the loop below: a few lines inside the
+// reducer's hot loop cost several percent on arithmetic-heavy checking, whatever
+// they do, while a call out here costs nothing
 export function term_wnf(book: Book, term: HTerm): HTerm {
+  return nat_prim(term) ?? term_wnf_body(book, term);
+}
+
+function term_wnf_body(book: Book, term: HTerm): HTerm {
   const frs: Frame[] = [];
   let tm: HTerm = term;
   let lhs: { t: () => HTerm; n: number } | null = null;
